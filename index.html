@@ -1,0 +1,2586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <link rel="icon" href="data:,">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LP Care Pathology</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Google Fonts - Inter -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            signInWithCustomToken, 
+            onAuthStateChanged,
+            signInWithEmailAndPassword,
+            createUserWithEmailAndPassword,
+            signOut
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            collection, 
+            doc, 
+            getDoc, 
+            setDoc, 
+            addDoc, 
+            updateDoc, 
+            deleteDoc, 
+            query, 
+            where, 
+            onSnapshot,
+            getDocs // Added for initial data fetch if not using onSnapshot for all
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        // Removed Firebase Storage imports as it's no longer used for report content
+
+        // Provided Firebase Configuration
+        const firebaseConfig = {
+            apiKey: "AIzaSyClFsJ2u-G0J6uuF0zQ79OQcWctrJd7HoU",
+            authDomain: "pathology-e4572.firebaseapp.com",
+            projectId: "pathology-e4572",
+            storageBucket: "pathology-e4572.firebasestorage.app",
+            messagingSenderId: "747555513356",
+            appId: "1:747555513356:web:4687ba474ec7caa94c3a29",
+            measurementId: "G-HZ0KEZ1FE2"
+        };
+
+        // Global Firebase variables (provided by Canvas environment, or fallback to default)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app;
+        let auth;
+        let db;
+        // let storage; // Removed storage variable
+        let currentUserId = null; // To store the current user's ID
+
+        // Global application state (simulating React state)
+        window.appState = {
+            user: null, // { id, email, role }
+            tests: [],
+            bookings: [], // This will now hold ALL bookings for admin, and patient's own bookings for patient
+            isAuthReady: false // To track if Firebase auth state is ready
+        };
+
+        // Admin Demo Credentials (for display only, creation is manual)
+        const ADMIN_EMAIL = "admin@pathologylab.com";
+        const ADMIN_PASSWORD = "admin123";
+
+        // Initialize Firebase and set up auth listener
+        window.onload = async () => {
+            try {
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+                // storage = getStorage(app); // Removed Storage initialization
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        currentUserId = user.uid;
+                        // Fetch user role from Firestore
+                        const userDocRef = doc(db, `artifacts/${appId}/users/${currentUserId}`);
+                        const userDocSnap = await getDoc(userDocRef);
+                        
+                        let userRole = 'patient'; // Default role
+                        if (userDocSnap.exists()) {
+                            userRole = userDocSnap.data().role || 'patient';
+                        } else {
+                            // If user document doesn't exist (e.g., for anonymous or new sign-ups), create it
+                            // For security, do NOT set role to 'admin' here. Admins are manually set.
+                            await setDoc(userDocRef, { email: user.email, role: userRole }, { merge: true });
+                        }
+                        window.appState.user = { id: user.uid, email: user.email, role: userRole };
+                        console.log("User signed in:", window.appState.user);
+
+                        // Start listening to data
+                        await setupFirestoreListeners();
+
+                    } else {
+                        currentUserId = null;
+                        window.appState.user = null; // Clear user on sign out
+                        window.appState.tests = []; // Clear data on logout
+                        window.appState.bookings = []; // Clear data on logout
+                        console.log("User signed out or not authenticated.");
+                    }
+                    window.appState.isAuthReady = true; // Auth state is now known
+                    renderView(); // Re-render based on new auth state
+                });
+
+                // Attempt to sign in with custom token if available, otherwise anonymously
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                    console.log("Signed in with custom token.");
+                } else {
+                    // Removed signInAnonymously call to enforce explicit login/registration
+                    console.log("Not signing in anonymously. User must explicitly log in or register.");
+                }
+
+            } catch (error) {
+                console.error("Firebase initialization or authentication error:", error);
+                showToast({
+                    title: "Firebase Error",
+                    description: "Failed to initialize Firebase. Some features may not work. Check console for details.",
+                    variant: "destructive"
+                });
+                window.appState.isAuthReady = true; // Mark as ready even on error to allow render
+                renderView(); // Initial render even if Firebase fails
+            }
+        };
+
+        // Setup Firestore real-time listeners
+        async function setupFirestoreListeners() {
+            if (!db) {
+                console.error("Firestore not initialized.");
+                return;
+            }
+
+            // Listen to Tests collection (public data)
+            const testsCollectionRef = collection(db, `artifacts/${appId}/public/data/tests`);
+            onSnapshot(testsCollectionRef, (snapshot) => {
+                const updatedTests = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                window.appState.tests = updatedTests;
+                console.log("Tests updated:", updatedTests);
+                renderView(); // Re-render when tests change
+            }, (error) => {
+                console.error("Error listening to tests:", error);
+                showToast({
+                    title: "Data Sync Error",
+                    description: "Failed to load tests. Check console.",
+                    variant: "destructive"
+                });
+            });
+
+            // Listen to Bookings collection based on user role
+            if (window.appState.user && window.appState.user.role === 'admin') {
+                // Admin: Listen to the new top-level 'all_bookings' collection
+                const allBookingsCollectionRef = collection(db, `artifacts/${appId}/public/data/all_bookings`);
+                onSnapshot(allBookingsCollectionRef, (snapshot) => {
+                    const updatedBookings = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    window.appState.bookings = updatedBookings;
+                    console.log("Admin bookings updated:", updatedBookings);
+                    renderView(); // Re-render when bookings change
+                }, (error) => {
+                    console.error("Error listening to all bookings (admin):", error);
+                    showToast({
+                        title: "Data Sync Error",
+                        description: "Failed to load all bookings for admin. Check console.",
+                        variant: "destructive"
+                    });
+                });
+            } else if (window.appState.user && window.appState.user.role === 'patient') {
+                // Patient: Only listen to their own bookings from the central collection
+                const allBookingsCollectionRef = collection(db, `artifacts/${appId}/public/data/all_bookings`);
+                const q = query(allBookingsCollectionRef, where("userId", "==", window.appState.user.id));
+                onSnapshot(q, (snapshot) => {
+                    const updatedBookings = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    window.appState.bookings = updatedBookings;
+                    console.log("Patient bookings updated:", updatedBookings);
+                    renderView(); // Re-render when bookings change
+                }, (error) => {
+                    console.error("Error listening to patient bookings:", error);
+                    showToast({
+                        title: "Data Sync Error",
+                        description: "Failed to load your bookings. Check console.",
+                        variant: "destructive"
+                    });
+                });
+            }
+        }
+
+
+        // Expose Firebase-like functions to global scope for use in main script
+        window.firebaseAuth = {
+            login: async (email, password) => {
+                try {
+                    const userCredential = await signInWithEmailAndPassword(auth, email, password);
+                    const user = userCredential.user;
+                    const userDocRef = doc(db, `artifacts/${appId}/users/${user.uid}`);
+                    const userDocSnap = await getDoc(userDocRef);
+                    let role = 'patient';
+                    if (userDocSnap.exists()) {
+                        role = userDocSnap.data().role || 'patient';
+                    } else {
+                        // If user doc doesn't exist, create it with default patient role
+                        await setDoc(userDocRef, { email: user.email, role: role }, { merge: true });
+                    }
+                    window.appState.user = { id: user.uid, email: user.email, role: role };
+                    await setupFirestoreListeners(); // Re-setup listeners for the new user
+                    return true;
+                } catch (error) {
+                    console.error("Firebase login error:", error);
+                    let errorMessage = "Invalid credentials.";
+                    if (error.code === 'auth/user-not-found') {
+                        errorMessage = "No account found with this email.";
+                    } else if (error.code === 'auth/wrong-password') {
+                        errorMessage = "Incorrect password.";
+                    } else if (error.code === 'auth/invalid-email') {
+                        errorMessage = "Invalid email format.";
+                    }
+                    showToast({ title: "Login Failed", description: errorMessage, variant: "destructive" });
+                    return false;
+                }
+            },
+            register: async (email, password, role) => {
+                try {
+                    // Client-side registration always creates a 'patient' role.
+                    // Admin roles are set manually in Firebase console.
+                    if (role === 'admin') {
+                         showToast({ title: "Registration Failed", description: "Admin accounts cannot be registered via this form. Contact administrator.", variant: "destructive" });
+                         return false;
+                    }
+                    const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+                    const user = userCredential.user;
+                    await setDoc(doc(db, `artifacts/${appId}/users/${user.uid}`), {
+                        email: email,
+                        role: 'patient' // Always register as patient from client
+                    });
+                    window.appState.user = { id: user.uid, email: email, role: 'patient' };
+                    await setupFirestoreListeners(); // Re-setup listeners for the new user
+                    return true;
+                } catch (error) {
+                    console.error("Firebase registration error:", error);
+                    let errorMessage = "Registration failed.";
+                    if (error.code === 'auth/email-already-in-use') {
+                        errorMessage = "This email is already registered.";
+                    } else if (error.code === 'auth/weak-password') {
+                        errorMessage = "Password is too weak (min 6 characters).";
+                    } else if (error.code === 'auth/invalid-email') {
+                        errorMessage = "Invalid email format.";
+                    }
+                    showToast({ title: "Registration Failed", description: errorMessage, variant: "destructive" });
+                    return false;
+                }
+            },
+            logout: async () => {
+                try {
+                    await signOut(auth);
+                    window.appState.user = null;
+                    window.appState.tests = [];
+                    window.appState.bookings = [];
+                    console.log("Logged out.");
+                    showToast({
+                        title: "Logged Out",
+                        description: "You have been successfully logged out.",
+                        variant: "success"
+                    });
+                    currentView = 'home'; // Redirect to home after logout
+                    renderView();
+                } catch (error) {
+                    console.error("Error logging out:", error);
+                    showToast({ title: "Logout Failed", description: "An error occurred during logout.", variant: "destructive" });
+                }
+            },
+            addTest: async (name, price) => {
+                try {
+                    if (!db || !auth.currentUser || window.appState.user.role !== 'admin') {
+                        showToast({ title: "Permission Denied", description: "Only admins can add tests.", variant: "destructive" });
+                        return;
+                    }
+                    const testsCollectionRef = collection(db, `artifacts/${appId}/public/data/tests`);
+                    await addDoc(testsCollectionRef, { name, price });
+                    showToast({ title: "Test Added", description: `${name} added successfully.`, variant: "success" });
+                } catch (error) {
+                    console.error("Error adding test:", error);
+                    showToast({ title: "Error", description: "Failed to add test.", variant: "destructive" });
+                }
+            },
+            deleteTest: async (testId) => {
+                try {
+                    if (!db || !auth.currentUser || window.appState.user.role !== 'admin') {
+                        showToast({ title: "Permission Denied", description: "Only admins can delete tests.", variant: "destructive" });
+                        return;
+                    }
+                    const testDocRef = doc(db, `artifacts/${appId}/public/data/tests/${testId}`);
+                    await deleteDoc(testDocRef);
+                    showToast({ title: "Test Deleted", description: "Test removed successfully.", variant: "success" });
+                } catch (error) {
+                    console.error("Error deleting test:", error);
+                    showToast({ title: "Error", description: "Failed to delete test.", variant: "destructive" });
+                }
+            },
+            bookTest: async (testId, appointmentDate, patientName, patientMobile, patientAddress) => { // Added new params
+                try {
+                    if (!db || !auth.currentUser || !window.appState.user) {
+                        showToast({ title: "Authentication Required", description: "Please login to book a test.", variant: "destructive" });
+                        return;
+                    }
+                    const test = window.appState.tests.find(t => t.id === testId);
+                    if (!test) {
+                        showToast({ title: "Test Not Found", description: "Selected test is invalid.", variant: "destructive" });
+                        return;
+                    }
+                    if (!patientName || !patientMobile || !patientAddress) {
+                        showToast({ title: "Incomplete Information", description: "Please fill in all patient details.", variant: "destructive" });
+                        return;
+                    }
+
+
+                    const newBookingData = {
+                        userId: window.appState.user.id,
+                        userEmail: window.appState.user.email,
+                        testId: test.id,
+                        testName: test.name,
+                        appointmentDate: appointmentDate,
+                        patientName: patientName, // New field
+                        patientMobile: patientMobile, // New field
+                        patientAddress: patientAddress, // New field
+                        status: 'pending',
+                        createdAt: new Date().toISOString()
+                    };
+
+                    // Add to all_bookings collection.
+                    const allBookingsCollectionRef = collection(db, `artifacts/${appId}/public/data/all_bookings`);
+                    const newBookingDocRef = await addDoc(allBookingsCollectionRef, newBookingData); // Firestore generates ID
+                    
+                    // Update the document with its own ID for easier reference in state/queries
+                    await updateDoc(doc(allBookingsCollectionRef, newBookingDocRef.id), { id: newBookingDocRef.id });
+
+                    showToast({ title: "Test Booked", description: `Test ${test.name} booked for ${appointmentDate}.`, variant: "success" });
+                } catch (error) {
+                    console.error("Error booking test:", error);
+                    showToast({ title: "Error", description: "Failed to book test.", variant: "destructive" });
+                }
+            },
+            // Modified uploadReport to accept a description instead of a file
+            uploadReport: async (bookingId, reportDescription) => { 
+                try {
+                    if (!db || !auth.currentUser || window.appState.user.role !== 'admin') {
+                        showToast({ title: "Permission Denied", description: "Only admins can upload reports.", variant: "destructive" });
+                        return;
+                    }
+                    if (!reportDescription || reportDescription.trim() === '') {
+                        showToast({ title: "Missing Description", description: "Please provide a report description.", variant: "destructive" });
+                        return;
+                    }
+
+                    // For demo, the reportUrl will now store the description directly
+                    const reportContent = reportDescription; 
+
+                    // Update in the central all_bookings collection with the report content (description)
+                    const allBookingDocRef = doc(db, `artifacts/${appId}/public/data/all_bookings/${bookingId}`);
+                    await updateDoc(allBookingDocRef, {
+                        status: 'completed',
+                        reportContent: reportContent, // Changed from reportUrl to reportContent
+                        completedAt: new Date().toISOString()
+                    });
+
+                    showToast({ title: "Report Added", description: "Report description added successfully.", variant: "success" });
+                } catch (error) {
+                    console.error("Error adding report description:", error);
+                    showToast({ title: "Error", description: `Failed to add report description: ${error.message}`, variant: "destructive" });
+                }
+            },
+        };
+    </script>
+
+    <style>
+        /* Custom Tailwind Configuration */
+        :root {
+            --primary: #1a73e8; /* A shade of blue for primary actions/branding */
+            --primary-dark: #155bb5;
+            --primary-light: #4285f4;
+            --medical-gradient-start: #1a73e8;
+            --medical-gradient-end: #0c4a93;
+            --subtle-gradient-start: #f8faff;
+            --subtle-gradient-end: #ffffff;
+            --card-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            --elevated-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            --foreground: #1f2937; /* gray-900 */
+            --muted-foreground: #6b7280; /* gray-600 */
+            --muted: #f3f4f6; /* gray-100 */
+            --destructive: #ef4444; /* red-500 */
+            --warning: #f59e0b; /* amber-500 */
+            --success: #22c55e; /* green-500 */
+        }
+
+        html, body {
+            font-family: 'Inter', sans-serif;
+            scroll-behavior: smooth;
+        }
+
+        .bg-gradient-subtle {
+            background-image: linear-gradient(to bottom right, var(--subtle-gradient-start), var(--subtle-gradient-end));
+        }
+
+        .bg-gradient-medical {
+            background-image: linear-gradient(to right, var(--medical-gradient-start), var(--medical-gradient-end));
+        }
+
+        .text-primary { color: var(--primary); }
+        .bg-primary { background-color: var(--primary); }
+        .bg-primary\/10 { background-color: rgba(26, 115, 232, 0.1); } /* primary with 10% opacity */
+        .hover\:bg-primary-dark:hover { background-color: var(--primary-dark); }
+        .hover\:text-primary:hover { color: var(--primary); }
+        .text-warning { color: var(--warning); }
+        .text-success { color: var(--success); }
+        .bg-yellow-50 { background-color: #fffbeb; }
+        .border-yellow-200 { border-color: #fde68a; }
+        .bg-green-50 { background-color: #f0fdf4; }
+        .border-green-200 { border-color: #bbf7d0; }
+        .bg-success { background-color: var(--success); }
+
+
+        .shadow-card { box-shadow: var(--card-shadow); }
+        .hover\:shadow-elevated:hover { box-shadow: var(--elevated-shadow); }
+        .shadow-elevated { box-shadow: var(--elevated-shadow); }
+        .focus\:shadow-medical:focus { box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.3); /* primary color with opacity */ }
+
+        /* Custom button styles to replicate MedicalButton component */
+        .btn-medical {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.75rem 1.5rem; /* py-3 px-6 */
+            border-radius: 0.5rem; /* rounded-lg */
+            font-weight: 600; /* font-semibold */
+            transition: all 0.2s ease-in-out;
+            cursor: pointer;
+            border: 1px solid transparent;
+        }
+
+        .btn-medical-default {
+            background-color: var(--primary);
+            color: white;
+        }
+        .btn-medical-default:hover {
+            background-color: var(--primary-dark);
+        }
+
+        .btn-medical-ghost {
+            background-color: transparent;
+            color: #4b5563; /* gray-700 */
+        }
+        .btn-medical-ghost:hover {
+            background-color: #f3f4f6; /* gray-100 */
+            color: #1f2937; /* gray-900 */
+        }
+        .btn-medical-ghost.text-white {
+            color: white;
+        }
+        .btn-medical-ghost.text-white:hover {
+            background-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .btn-medical-outline {
+            background-color: transparent;
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+        .btn-medical-outline:hover {
+            background-color: var(--primary);
+            color: white;
+        }
+        .btn-medical-outline.text-white {
+            color: white;
+            border-color: white;
+        }
+        .btn-medical-outline.text-white:hover {
+            background-color: white;
+            color: var(--primary);
+        }
+
+        .btn-medical-sm {
+            padding: 0.5rem 1rem; /* py-2 px-4 */
+            font-size: 0.875rem; /* text-sm */
+        }
+
+        .btn-medical-lg {
+            padding: 1rem 2rem; /* py-4 px-8 */
+            font-size: 1.125rem; /* text-lg */
+        }
+
+        /* Card styles */
+        .card {
+            background-color: white;
+            border-radius: 0.5rem; /* rounded-lg */
+            overflow: hidden;
+            border: 1px solid #e5e7eb; /* border-gray-200 */
+        }
+        .card-header {
+            padding: 1.5rem;
+        }
+        .card-title {
+            font-size: 1.25rem; /* text-xl */
+            font-weight: 600; /* font-semibold */
+            color: #1f2937; /* gray-900 */
+        }
+        .card-description {
+            font-size: 0.875rem; /* text-sm */
+            color: #6b7280; /* gray-600 */
+        }
+        .card-content {
+            padding: 1.5rem;
+            padding-top: 0;
+        }
+
+        /* Badge styles */
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.25rem 0.75rem; /* px-3 py-1 */
+            border-radius: 9999px; /* rounded-full */
+            font-size: 0.75rem; /* text-xs */
+            font-weight: 500; /* font-medium */
+        }
+        .badge-secondary {
+            background-color: #e5e7eb; /* gray-200 */
+            color: #374151; /* gray-700 */
+        }
+
+        /* Input and Select styles */
+        input[type="email"],
+        input[type="password"],
+        input[type="text"],
+        input[type="number"],
+        input[type="file"],
+        input[type="date"],
+        textarea, /* Added textarea */
+        select {
+            display: block;
+            width: 100%;
+            padding: 0.625rem 1rem; /* py-2.5 px-4 */
+            border-radius: 0.375rem; /* rounded-md */
+            border: 1px solid #d1d5db; /* border-gray-300 */
+            background-color: white;
+            color: #1f2937; /* text-gray-900 */
+            font-size: 1rem; /* text-base */
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        input[type="email"]:focus,
+        input[type="password"]:focus,
+        input[type="text"]:focus,
+        input[type="number"]:focus,
+        input[type="file"]:focus,
+        input[type="date"]:focus,
+        textarea:focus, /* Added textarea */
+        select:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.3);
+        }
+
+        /* Tabs styles */
+        .tabs-list {
+            display: grid;
+            background-color: var(--muted);
+            border-radius: 0.5rem;
+            padding: 0.25rem;
+            gap: 0.25rem;
+        }
+        .tabs-trigger {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.5rem 1rem;
+            border-radius: 0.375rem;
+            font-weight: 500;
+            color: var(--muted-foreground);
+            cursor: pointer;
+            transition: all 0.2s ease-in-out;
+            background-color: transparent;
+            border: none;
+        }
+        .tabs-trigger[data-state="active"] {
+            background-color: white;
+            color: var(--foreground);
+            box-shadow: var(--card-shadow);
+        }
+        .tabs-trigger:hover:not([data-state="active"]) {
+            color: var(--foreground);
+        }
+        .tabs-content {
+            display: none;
+        }
+        .tabs-content[data-state="active"] {
+            display: block;
+        }
+
+        /* Select component styling */
+        .select-trigger {
+            display: flex;
+            height: 2.5rem; /* h-10 */
+            width: 100%;
+            align-items: center;
+            justify-content: space-between;
+            border-radius: 0.375rem; /* rounded-md */
+            border: 1px solid #d1d5db; /* border-gray-300 */
+            background-color: white;
+            padding: 0 0.75rem; /* px-3 */
+            font-size: 0.875rem; /* text-sm */
+            box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); /* shadow-sm */
+            transition: all 0.2s;
+            cursor: pointer;
+        }
+        .select-trigger:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.3);
+        }
+        .select-content {
+            background-color: white;
+            border-radius: 0.375rem;
+            box-shadow: var(--elevated-shadow);
+            max-height: 15rem; /* 240px */
+            overflow-y: auto;
+            z-index: 50; /* z-50 */
+            position: absolute; /* Needed for dropdown */
+            width: var(--radix-select-trigger-width); /* Adjust width to trigger */
+        }
+        .select-item {
+            padding: 0.5rem 0.75rem;
+            font-size: 0.875rem;
+            cursor: pointer;
+            transition: background-color 0.1s;
+        }
+        .select-item:hover {
+            background-color: var(--muted);
+        }
+        .select-item[data-state="checked"] {
+            background-color: var(--muted);
+            font-weight: 600;
+        }
+
+        /* Toast notification styles */
+        #toast-container {
+            position: fixed;
+            top: 1rem;
+            right: 1rem;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+        .toast {
+            background-color: white;
+            border-radius: 0.5rem;
+            padding: 1rem 1.5rem;
+            box-shadow: var(--elevated-shadow);
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            min-width: 250px;
+            max-width: 350px;
+            opacity: 0;
+            transform: translateY(-20px);
+            transition: opacity 0.3s ease-out, transform 0.3s ease-out;
+        }
+        .toast.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+        .toast.destructive {
+            border-left: 4px solid var(--destructive);
+        }
+        .toast.success {
+            border-left: 4px solid var(--success);
+        }
+        .toast-icon {
+            width: 1.25rem;
+            height: 1.25rem;
+        }
+        .toast-title {
+            font-weight: 600;
+            color: var(--foreground);
+        }
+        .toast-description {
+            font-size: 0.875rem;
+            color: var(--muted-foreground);
+        }
+        .toast.destructive .toast-icon {
+            color: var(--destructive);
+        }
+        .toast.success .toast-icon {
+            color: var(--success);
+        }
+
+        /* Utility classes for Lucide icons (adjust size and color) */
+        .icon {
+            display: inline-block;
+            width: 1.5rem; /* h-6 w-6 */
+            height: 1.5rem; /* h-6 w-6 */
+            stroke-width: 2;
+            stroke: currentColor;
+            fill: none;
+            line-height: 1;
+        }
+        .icon-lg {
+            width: 2rem; /* h-8 w-8 */
+            height: 2rem; /* h-8 w-8 */
+        }
+        .icon-xl {
+            width: 3rem; /* h-12 w-12 */
+            height: 3rem; /* h-12 w-12 */
+        }
+        .icon-sm {
+            width: 1rem; /* h-4 w-4 */
+            height: 1rem; /* h-4 w-4 */
+        }
+        .icon-primary { color: var(--primary); }
+        .icon-yellow-400 { color: #facc15; }
+        .icon-red-500 { color: var(--destructive); }
+        .icon-green-500 { color: var(--success); }
+        .icon-warning { color: var(--warning); }
+        .fill-current { fill: currentColor; }
+
+        /* Responsive adjustments for grids */
+        @media (min-width: 768px) { /* md breakpoint */
+            .md\:grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .md\:grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+            .md\:grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+            .md\:w-auto { width: auto; }
+        }
+        @media (min-width: 1024px) { /* lg breakpoint */
+            .lg\:grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .lg\:grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+        }
+        @media (max-width: 640px) { /* sm breakpoint */
+            .sm\:flex-col { flex-direction: column; }
+            .sm\:flex-row { flex-direction: row; }
+        }
+    </style>
+</head>
+<body class="font-inter antialiased">
+    <!-- Main Application Container -->
+    <div id="app-root">
+        <!-- Content will be dynamically loaded here -->
+    </div>
+
+    <!-- Toast Notification Container -->
+    <div id="toast-container"></div>
+
+    <script>
+        // --- Global State and UI Management ---
+        let currentView = 'home'; // 'home', 'auth', 'admin-dashboard', 'patient-dashboard'
+        const appRoot = document.getElementById('app-root');
+        const toastContainer = document.getElementById('toast-container');
+
+        /**
+         * Renders a toast notification.
+         * @param {object} options - Toast options.
+         * @param {string} options.title - The title of the toast.
+         * @param {string} options.description - The description text.
+         * @param {string} [options.variant='success'] - 'success' or 'destructive'.
+         * @param {number} [options.duration=3000] - Duration in milliseconds.
+         */
+        function showToast(options) {
+            const { title, description, variant = 'success', duration = 3000 } = options;
+
+            const toastDiv = document.createElement('div');
+            toastDiv.classList.add('toast', variant);
+
+            let iconSvg = '';
+            if (variant === 'success') {
+                iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon toast-icon icon-green-500">
+                                <path d="M22 11.08V12a10 10 0 11-5.93-9.14"></path>
+                                <polyline points="22 4 12 14.01 9 11.01"></polyline>
+                            </svg>`;
+            } else if (variant === 'destructive') {
+                iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon toast-icon icon-red-500">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <line x1="15" y1="9" x2="9" y2="15"></line>
+                                <line x1="9" y1="9" x2="15" y2="15"></line>
+                            </svg>`;
+            }
+
+            toastDiv.innerHTML = `
+                ${iconSvg}
+                <div>
+                    <div class="toast-title">${title}</div>
+                    <div class="toast-description">${description}</div>
+                </div>
+            `;
+
+            toastContainer.appendChild(toastDiv);
+
+            // Trigger reflow to enable transition
+            void toastDiv.offsetWidth;
+            toastDiv.classList.add('show');
+
+            setTimeout(() => {
+                toastDiv.classList.remove('show');
+                toastDiv.addEventListener('transitionend', () => toastDiv.remove());
+            }, duration);
+        }
+
+        /**
+         * Renders the appropriate view (homepage, auth form, or dashboards).
+         */
+        function renderView() {
+            appRoot.innerHTML = ''; // Clear previous content
+            if (window.appState.isAuthReady) { // Only render if auth state is determined
+                if (window.appState.user) {
+                    if (window.appState.user.role === 'admin') {
+                        appRoot.innerHTML = getAdminDashboardHTML();
+                        addAdminDashboardEventListeners();
+                    } else {
+                        appRoot.innerHTML = getPatientDashboardHTML();
+                        addPatientDashboardEventListeners();
+                    }
+                } else {
+                    if (currentView === 'home') {
+                        appRoot.innerHTML = getHomePageHTML();
+                        addHomePageEventListeners();
+                    } else if (currentView === 'auth') {
+                        appRoot.innerHTML = getAuthFormHTML();
+                        addAuthFormEventListeners();
+                        updateAuthFormModeUI(); // Ensure correct mode is set on render
+                    }
+                }
+            } else {
+                // Show a loading indicator or blank page while auth is initializing
+                appRoot.innerHTML = `<div class="min-h-screen flex items-center justify-center bg-gradient-subtle">
+                                        <div class="text-center text-gray-700">
+                                            <svg class="animate-spin h-10 w-10 text-primary mx-auto mb-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                            </svg>
+                                            <p>Loading application...</p>
+                                        </div>
+                                     </div>`;
+            }
+        }
+
+        /**
+         * Switches the view to the authentication form.
+         * @param {string} mode - 'login' or 'register'
+         */
+        function switchToAuth(mode) {
+            currentView = 'auth';
+            initialAuthFormMode = mode; // Set the initial mode for the auth form
+            renderView();
+        }
+
+        /**
+         * Switches the view back to the homepage.
+         */
+        function switchToHome() {
+            currentView = 'home';
+            renderView();
+        }
+
+        // --- Homepage HTML and Event Listeners ---
+        function getHomePageHTML() {
+            return `
+                <div class="min-h-screen bg-gradient-subtle">
+                    <!-- Header -->
+                    <header class="bg-white shadow-card">
+                        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div class="flex justify-between items-center h-16">
+                                <div class="flex items-center">
+                                    <!-- Stethoscope Icon -->
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-lg text-primary mr-3">
+                                        <path d="M12 2L12 3"></path>
+                                        <path d="M12 22L12 21"></path>
+                                        <path d="M12 10L12 14"></path>
+                                        <path d="M12 3C14.7614 3 17 5.23858 17 8L17 16C17 18.7614 14.7614 21 12 21L12 21C9.23858 21 7 18.7614 7 16L7 8C7 5.23858 9.23858 3 12 3Z"></path>
+                                        <path d="M17 8L20 8"></path>
+                                        <path d="M7 8L4 8"></path>
+                                        <path d="M17 16L20 16"></path>
+                                        <path d="M7 16L4 16"></path>
+                                    </svg>
+                                    <h1 class="text-xl font-bold text-gray-900">LP Care Pathology</h1>
+                                </div>
+                                <div class="flex items-center space-x-4">
+                                    <button id="home-login-btn" class="btn-medical btn-medical-ghost">
+                                        Login
+                                    </button>
+                                    <button id="home-register-btn" class="btn-medical btn-medical-default">
+                                        Register
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </header>
+
+                    <!-- Hero Section -->
+                    <section class="relative py-20 overflow-hidden">
+                        <div class="absolute inset-0">
+                            <img 
+                                src="https://placehold.co/1920x1080/E0F2F7/000000?text=Modern+Medical+Lab" 
+                                alt="Modern medical laboratory" 
+                                class="w-full h-full object-cover opacity-10"
+                            />
+                            <div class="absolute inset-0 bg-gradient-medical opacity-90"></div>
+                        </div>
+                        <div class="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+                            <div class="max-w-3xl mx-auto">
+                                <h1 class="text-5xl font-bold text-white mb-6">
+                                    Professional Medical Testing Services
+                                </h1>
+                                <p class="text-xl text-blue-100 mb-8">
+                                    Accurate diagnostics, fast results, and compassionate care. Your health is our priority with state-of-the-art laboratory testing.
+                                </p>
+                                <div class="flex flex-col sm:flex-row gap-4 justify-center">
+                                    <button id="hero-book-test-btn" class="btn-medical btn-medical-lg btn-medical-outline text-white border-white hover:bg-white hover:text-primary">
+                                        Book Your Test Today
+                                    </button>
+                                    <button id="hero-view-reports-btn" class="btn-medical btn-medical-lg btn-medical-ghost text-white hover:bg-white/20">
+                                        View Your Reports
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Features Section -->
+                    <section class="py-16 bg-white">
+                        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div class="text-center mb-12">
+                                <h2 class="text-3xl font-bold text-gray-900 mb-4">Why Choose Our Laboratory?</h2>
+                                <p class="text-gray-600 max-w-2xl mx-auto">
+                                    We combine cutting-edge technology with expert medical professionals to deliver reliable and accurate diagnostic services.
+                                </p>
+                            </div>
+                            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
+                                <!-- Feature 1: Quick Results -->
+                                <div class="card shadow-card hover:shadow-elevated transition-all duration-300">
+                                    <div class="card-header text-center">
+                                        <div class="w-12 h-12 bg-primary/10 rounded-lg flex items-center justify-center mx-auto mb-4">
+                                            <!-- Clock Icon -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon text-primary">
+                                                <circle cx="12" cy="12" r="10"></circle>
+                                                <polyline points="12 6 12 12 16 14"></polyline>
+                                            </svg>
+                                        </div>
+                                        <h3 class="card-title text-lg">Quick Results</h3>
+                                    </div>
+                                    <div class="card-content text-center">
+                                        <p class="text-gray-600">Fast turnaround time with accurate results</p>
+                                    </div>
+                                </div>
+                                <!-- Feature 2: NABL Certified -->
+                                <div class="card shadow-card hover:shadow-elevated transition-all duration-300">
+                                    <div class="card-header text-center">
+                                        <div class="w-12 h-12 bg-primary/10 rounded-lg flex items-center justify-center mx-auto mb-4">
+                                            <!-- Shield Icon -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon text-primary">
+                                                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                                            </svg>
+                                        </div>
+                                        <h3 class="card-title text-lg">NABL Certified</h3>
+                                    </div>
+                                    <div class="card-content text-center">
+                                        <p class="text-gray-600">Nationally accredited testing laboratory</p>
+                                    </div>
+                                </div>
+                                <!-- Feature 3: Expert Team -->
+                                <div class="card shadow-card hover:shadow-elevated transition-all duration-300">
+                                    <div class="card-header text-center">
+                                        <div class="w-12 h-12 bg-primary/10 rounded-lg flex items-center justify-center mx-auto mb-4">
+                                            <!-- Users Icon -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon text-primary">
+                                                <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"></path>
+                                                <circle cx="9" cy="7" r="4"></circle>
+                                                <path d="M23 21v-2a4 4 0 00-3-3.87"></path>
+                                                <path d="M16 3.13a4 4 0 010 7.75"></path>
+                                            </svg>
+                                        </div>
+                                        <h3 class="card-title text-lg">Expert Team</h3>
+                                    </div>
+                                    <div class="card-content text-center">
+                                        <p class="text-gray-600">Qualified pathologists and technicians</p>
+                                    </div>
+                                </div>
+                                <!-- Feature 4: Quality Assured -->
+                                <div class="card shadow-card hover:shadow-elevated transition-all duration-300">
+                                    <div class="card-header text-center">
+                                        <div class="w-12 h-12 bg-primary/10 rounded-lg flex items-center justify-center mx-auto mb-4">
+                                            <!-- Award Icon -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon text-primary">
+                                                <circle cx="12" cy="8" r="7"></circle>
+                                                <polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"></polyline>
+                                            </svg>
+                                        </div>
+                                        <h3 class="card-title text-lg">Quality Assured</h3>
+                                    </div>
+                                    <div class="card-content text-center">
+                                        <p class="text-gray-600">State-of-the-art equipment and processes</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Services Section -->
+                    <section class="py-16 bg-gray-50">
+                        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div class="text-center mb-12">
+                                <h2 class="text-3xl font-bold text-gray-900 mb-4">Our Popular Tests</h2>
+                                <p class="text-gray-600 max-w-2xl mx-auto">
+                                    Comprehensive range of diagnostic tests with competitive pricing and quick turnaround times.
+                                </p>
+                            </div>
+                            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                                <!-- Service 1: Complete Blood Count (CBC) -->
+                                <div class="card shadow-card hover:shadow-elevated transition-all duration-300">
+                                    <div class="card-header">
+                                        <div class="flex items-center justify-between mb-2">
+                                            <!-- TestTube Icon -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-lg text-primary">
+                                                <path d="M14.5 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V7.5L14.5 2z"></path>
+                                                <polyline points="14 2 14 8 20 8"></polyline>
+                                                <line x1="16" y1="13" x2="8" y2="13"></line>
+                                                <line x1="16" y1="17" x2="8" y2="17"></line>
+                                            </svg>
+                                            <span class="badge badge-secondary">2-4 hours</span>
+                                        </div>
+                                        <h3 class="card-title text-lg">Complete Blood Count (CBC)</h3>
+                                        <p class="card-description">Comprehensive blood analysis including red & white blood cells, platelets</p>
+                                    </div>
+                                    <div class="card-content">
+                                        <div class="flex items-center justify-between">
+                                            <span class="text-2xl font-bold text-primary">₹500</span>
+                                            <button id="service-book-btn-1" class="btn-medical btn-medical-sm btn-medical-outline">
+                                                Book Now
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <!-- Service 2: Lipid Profile -->
+                                <div class="card shadow-card hover:shadow-elevated transition-all duration-300">
+                                    <div class="card-header">
+                                        <div class="flex items-center justify-between mb-2">
+                                            <!-- Heart Icon -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-lg text-primary">
+                                                <path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z"></path>
+                                            </svg>
+                                            <span class="badge badge-secondary">6-8 hours</span>
+                                        </div>
+                                        <h3 class="card-title text-lg">Lipid Profile</h3>
+                                        <p class="card-description">Cholesterol and triglyceride levels for cardiovascular health assessment</p>
+                                    </div>
+                                    <div class="card-content">
+                                        <div class="flex items-center justify-between">
+                                            <span class="text-2xl font-bold text-primary">₹800</span>
+                                            <button id="service-book-btn-2" class="btn-medical btn-medical-sm btn-medical-outline">
+                                                Book Now
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <!-- Service 3: Thyroid Function Test -->
+                                <div class="card shadow-card hover:shadow-elevated transition-all duration-300">
+                                    <div class="card-header">
+                                        <div class="flex items-center justify-between mb-2">
+                                            <!-- Shield Icon -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-lg text-primary">
+                                                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                                            </svg>
+                                            <span class="badge badge-secondary">4-6 hours</span>
+                                        </div>
+                                        <h3 class="card-title text-lg">Thyroid Function Test</h3>
+                                        <p class="card-description">TSH, T3, T4 levels to evaluate thyroid gland functionality</p>
+                                    </div>
+                                    <div class="card-content">
+                                        <div class="flex items-center justify-between">
+                                            <span class="text-2xl font-bold text-primary">₹1200</span>
+                                            <button id="service-book-btn-3" class="btn-medical btn-medical-sm btn-medical-outline">
+                                                Book Now
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <!-- Service 4: Liver Function Test -->
+                                <div class="card shadow-card hover:shadow-elevated transition-all duration-300">
+                                    <div class="card-header">
+                                        <div class="flex items-center justify-between mb-2">
+                                            <!-- FileText Icon -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-lg text-primary">
+                                                <path d="M14.5 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V7.5L14.5 2z"></path>
+                                                <polyline points="14 2 14 8 20 8"></polyline>
+                                                <line x1="16" y1="13" x2="8" y2="13"></line>
+                                                <line x1="16" y1="17" x2="8" y2="17"></line>
+                                            </svg>
+                                            <span class="badge badge-secondary">4-6 hours</span>
+                                        </div>
+                                        <h3 class="card-title text-lg">Liver Function Test</h3>
+                                        <p class="card-description">Comprehensive liver enzyme and protein analysis</p>
+                                    </div>
+                                    <div class="card-content">
+                                        <div class="flex items-center justify-between">
+                                            <span class="text-2xl font-bold text-primary">₹900</span>
+                                            <button id="service-book-btn-4" class="btn-medical btn-medical-sm btn-medical-outline">
+                                                Book Now
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Stats Section -->
+                    <section class="py-16 bg-primary text-white">
+                        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div class="grid grid-cols-2 md:grid-cols-4 gap-8 text-center">
+                                <div>
+                                    <div class="text-4xl font-bold mb-2">50,000+</div>
+                                    <div class="text-blue-100">Tests Conducted</div>
+                                </div>
+                                <div>
+                                    <div class="text-4xl font-bold mb-2">15+</div>
+                                    <div class="text-blue-100">Years Experience</div>
+                                </div>
+                                <div>
+                                    <div class="text-4xl font-bold mb-2">99.8%</div>
+                                    <div class="text-blue-100">Accuracy Rate</div>
+                                </div>
+                                <div>
+                                    <div class="text-4xl font-bold mb-2">24/7</div>
+                                    <div class="text-blue-100">Emergency Service</div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Testimonials Section -->
+                    <section class="py-16 bg-white">
+                        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div class="text-center mb-12">
+                                <h2 class="text-3xl font-bold text-gray-900 mb-4">What Our Patients Say</h2>
+                            </div>
+                            <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+                                <!-- Testimonial 1 -->
+                                <div class="card shadow-card">
+                                    <div class="card-content p-6">
+                                        <div class="flex items-center mb-4">
+                                            <!-- Star Icon -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                        </div>
+                                        <p class="text-gray-600 mb-4">"Excellent service! Quick results and very professional staff. Highly recommended for all diagnostic needs."</p>
+                                        <div class="flex items-center">
+                                            <div class="w-10 h-10 bg-primary/10 rounded-full flex items-center justify-center mr-3">
+                                                <!-- Users Icon -->
+                                                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-primary">
+                                                    <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"></path>
+                                                    <circle cx="9" cy="7" r="4"></circle>
+                                                    <path d="M23 21v-2a4 4 0 00-3-3.87"></path>
+                                                    <path d="M16 3.13a4 4 0 010 7.75"></path>
+                                                </svg>
+                                            </div>
+                                            <div>
+                                                <div class="font-semibold">Sarah Johnson</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <!-- Testimonial 2 -->
+                                <div class="card shadow-card">
+                                    <div class="card-content p-6">
+                                        <div class="flex items-center mb-4">
+                                            <!-- Star Icon -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                        </div>
+                                        <p class="text-gray-600 mb-4">"As a physician, I trust this lab for my patients. Their accuracy and reliability are outstanding."</p>
+                                        <div class="flex items-center">
+                                            <div class="w-10 h-10 bg-primary/10 rounded-full flex items-center justify-center mr-3">
+                                                <!-- Users Icon -->
+                                                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-primary">
+                                                    <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"></path>
+                                                    <circle cx="9" cy="7" r="4"></circle>
+                                                    <path d="M23 21v-2a4 4 0 00-3-3.87"></path>
+                                                    <path d="M16 3.13a4 4 0 010 7.75"></path>
+                                                </svg>
+                                            </div>
+                                            <div>
+                                                <div class="font-semibold">Dr. Michael Chen</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <!-- Testimonial 3 -->
+                                <div class="card shadow-card">
+                                    <div class="card-content p-6">
+                                        <div class="flex items-center mb-4">
+                                            <!-- Star Icon -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-yellow-400 fill-current">
+                                                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                            </svg>
+                                        </div>
+                                        <p class="text-gray-600 mb-4">"User-friendly online platform and timely reports. Made my health monitoring so much easier."</p>
+                                        <div class="flex items-center">
+                                            <div class="w-10 h-10 bg-primary/10 rounded-full flex items-center justify-center mr-3">
+                                                <!-- Users Icon -->
+                                                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-primary">
+                                                    <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"></path>
+                                                    <circle cx="9" cy="7" r="4"></circle>
+                                                    <path d="M23 21v-2a4 4 0 00-3-3.87"></path>
+                                                    <path d="M16 3.13a4 4 0 010 7.75"></path>
+                                                </svg>
+                                            </div>
+                                            <div>
+                                                <div class="font-semibold">Priya Sharma</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- CTA Section -->
+                    <section class="py-16 bg-gradient-medical text-white">
+                        <div class="max-w-4xl mx-auto text-center px-4 sm:px-6 lg:px-8">
+                            <h2 class="text-3xl font-bold mb-4">Ready to Get Started?</h2>
+                            <p class="text-xl text-blue-100 mb-8">
+                                Book your test today and experience professional healthcare at its finest.
+                            </p>
+                            <div class="flex flex-col sm:flex-row gap-4 justify-center">
+                                <button id="cta-create-account-btn" class="btn-medical btn-medical-lg btn-medical-outline text-white border-white hover:bg-white hover:text-primary">
+                                    Create Account
+                                </button>
+                                <button id="cta-login-account-btn" class="btn-medical btn-medical-lg btn-medical-ghost text-white hover:bg-white/20">
+                                    Login to Account
+                                </button>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Footer -->
+                    <footer class="bg-gray-900 text-white py-12">
+                        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div class="grid grid-cols-1 md:grid-cols-4 gap-8">
+                                <div>
+                                    <div class="flex items-center mb-4">
+                                        <!-- Stethoscope Icon -->
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-lg text-primary mr-3">
+                                            <path d="M12 2L12 3"></path>
+                                            <path d="M12 22L12 21"></path>
+                                            <path d="M12 10L12 14"></path>
+                                            <path d="M12 3C14.7614 3 17 5.23858 17 8L17 16C17 18.7614 14.7614 21 12 21L12 21C9.23858 21 7 18.7614 7 16L7 8C7 5.23858 9.23858 3 12 3Z"></path>
+                                            <path d="M17 8L20 8"></path>
+                                            <path d="M7 8L4 8"></path>
+                                            <path d="M17 16L20 16"></path>
+                                            <path d="M7 16L4 16"></path>
+                                        </svg>
+                                        <h3 class="text-xl font-bold">LP Care Pathology</h3>
+                                    </div>
+                                    <p class="text-gray-400">
+                                        Professional medical testing services with accurate diagnostics and compassionate care.
+                                    </p>
+                                </div>
+                                <div>
+                                    <h4 class="text-lg font-semibold mb-4">Services</h4>
+                                    <ul class="space-y-2 text-gray-400">
+                                        <li>Blood Tests</li>
+                                        <li>Urine Analysis</li>
+                                        <li>Thyroid Function</li>
+                                        <li>Cardiac Markers</li>
+                                    </ul>
+                                </div>
+                                <div>
+                                    <h4 class="text-lg font-semibold mb-4">Quick Links</h4>
+                                    <ul class="space-y-2 text-gray-400">
+                                        <li><button id="footer-login-btn" class="hover:text-white">Patient Login</button></li>
+                                        <li><button id="footer-register-btn" class="hover:text-white">Register</button></li>
+                                        <li>Test Results</li>
+                                        <li>Book Appointment</li>
+                                    </ul>
+                                </div>
+                                <div>
+                                    <h4 class="text-lg font-semibold mb-4">Contact</h4>
+                                    <ul class="space-y-2 text-gray-400">
+                                        <li>📞 +91 78730 95514</li>
+                                        <li>lpcarepathology2023@gmail.com</li>
+                                        <li>📍 Kasafal,Baleswar</li>
+                                        <li>🕒 24/7 Emergency Service</li>
+                                    </ul>
+                                </div>
+                            </div>
+                            <div class="border-t border-gray-800 mt-8 pt-8 text-center text-gray-400">
+                                <p>&copy; 2024 LP Care Pathology. All rights reserved. | NABL Certified Laboratory</p>
+                            </div>
+                        </div>
+                    </footer>
+                </div>
+            `;
+        }
+
+        function addHomePageEventListeners() {
+            document.getElementById('home-login-btn').addEventListener('click', () => switchToAuth('login'));
+            document.getElementById('home-register-btn').addEventListener('click', () => switchToAuth('register'));
+            document.getElementById('hero-book-test-btn').addEventListener('click', () => switchToAuth('register'));
+            document.getElementById('hero-view-reports-btn').addEventListener('click', () => switchToAuth('login'));
+            document.getElementById('service-book-btn-1').addEventListener('click', () => switchToAuth('register'));
+            document.getElementById('service-book-btn-2').addEventListener('click', () => switchToAuth('register'));
+            document.getElementById('service-book-btn-3').addEventListener('click', () => switchToAuth('register'));
+            document.getElementById('service-book-btn-4').addEventListener('click', () => switchToAuth('register'));
+            document.getElementById('cta-create-account-btn').addEventListener('click', () => switchToAuth('register'));
+            document.getElementById('cta-login-account-btn').addEventListener('click', () => switchToAuth('login'));
+            document.getElementById('footer-login-btn').addEventListener('click', () => switchToAuth('login'));
+            document.getElementById('footer-register-btn').addEventListener('click', () => switchToAuth('register'));
+        }
+
+        // --- Auth Form HTML and Event Listeners ---
+        let initialAuthFormMode = 'login'; // 'login' or 'register'
+        let isLoginMode = true; // State for Auth Form
+        let authFormLoading = false; // Loading state for Auth Form
+
+        function getAuthFormHTML() {
+            return `
+                <div class="min-h-screen flex items-center justify-center bg-gradient-subtle p-4">
+                    <div class="w-full max-w-md">
+                        <div class="mb-6">
+                            <button id="auth-back-to-home-btn" class="btn-medical btn-medical-ghost flex items-center gap-2">
+                                <!-- ArrowLeft Icon -->
+                                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm">
+                                    <line x1="19" y1="12" x2="5" y2="12"></line>
+                                    <polyline points="12 19 5 12 12 5"></polyline>
+                                </svg>
+                                Back to Home
+                            </button>
+                        </div>
+                        
+                        <div class="text-center mb-8">
+                            <div class="flex items-center justify-center mb-4">
+                                <!-- Stethoscope Icon -->
+                                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-xl text-primary">
+                                    <path d="M12 2L12 3"></path>
+                                    <path d="M12 22L12 21"></path>
+                                    <path d="M12 10L12 14"></path>
+                                    <path d="M12 3C14.7614 3 17 5.23858 17 8L17 16C17 18.7614 14.7614 21 12 21L12 21C9.23858 21 7 18.7614 7 16L7 8C7 5.23858 9.23858 3 12 3Z"></path>
+                                    <path d="M17 8L20 8"></path>
+                                    <path d="M7 8L4 8"></path>
+                                    <path d="M17 16L20 16"></path>
+                                    <path d="M7 16L4 16"></path>
+                                </svg>
+                            </div>
+                            <h1 class="text-3xl font-bold text-foreground">LP Care Pathology</h1>
+                            <p class="text-muted-foreground mt-2">Professional Medical Testing Services</p>
+                        </div>
+
+                        <div class="card shadow-elevated">
+                            <div class="card-header text-center">
+                                <h2 id="auth-card-title" class="card-title flex items-center justify-center gap-2">
+                                    <span id="auth-icon-placeholder"></span>
+                                    <span id="auth-form-mode-text">Login</span>
+                                </h2>
+                                <p id="auth-card-description" class="card-description">Access your medical reports and book tests</p>
+                            </div>
+                            <div class="card-content">
+                                <form id="auth-form" class="space-y-4">
+                                    <div class="space-y-2">
+                                        <label for="auth-email" class="flex items-center gap-2">
+                                            <!-- Mail Icon -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm">
+                                                <rect x="2" y="4" width="20" height="16" rx="2"></rect>
+                                                <path d="M22 7L12 13 2 7"></path>
+                                            </svg>
+                                            Email
+                                        </label>
+                                        <input
+                                            id="auth-email"
+                                            type="email"
+                                            placeholder="Enter your email"
+                                            value=""
+                                            required
+                                            class="transition-all duration-200 focus:shadow-medical rounded-md"
+                                        />
+                                    </div>
+
+                                    <div class="space-y-2">
+                                        <label for="auth-password" class="flex items-center gap-2">
+                                            <!-- Lock Icon -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm">
+                                                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                                                <path d="M7 11V7a5 5 0 0110 0v4"></path>
+                                            </svg>
+                                            Password
+                                        </label>
+                                        <input
+                                            id="auth-password"
+                                            type="password"
+                                            placeholder="Enter your password"
+                                            value=""
+                                            required
+                                            class="transition-all duration-200 focus:shadow-medical rounded-md"
+                                        />
+                                    </div>
+
+                                    <!-- Role Selection (only for Register mode) -->
+                                    <div id="auth-role-selection" class="space-y-2" style="display: none;">
+                                        <label for="auth-role">Account Type</label>
+                                        <select id="auth-role" class="transition-all duration-200 focus:shadow-medical rounded-md">
+                                            <option value="patient">Patient Account</option>
+                                        </select>
+                                        <p class="text-xs text-muted-foreground">
+                                            Admin accounts are pre-configured. Contact administrator for admin access.
+                                        </p>
+                                    </div>
+
+                                    <button 
+                                        id="auth-submit-button"
+                                        type="submit" 
+                                        class="btn-medical btn-medical-default w-full" 
+                                        disabled
+                                    >
+                                        Login
+                                    </button>
+                                </form>
+
+                                <div class="mt-6 text-center">
+                                    <p class="text-sm text-muted-foreground">
+                                        <span id="auth-toggle-text">Don't have an account?</span>
+                                        <button
+                                            type="button"
+                                            id="auth-toggle-mode-btn"
+                                            class="ml-2 text-primary hover:underline font-medium"
+                                        >
+                                            Register here
+                                        </button>
+                                    </p>
+                                </div>
+
+                                <!-- Demo Credentials (only for Login mode) -->
+                                <div id="auth-demo-credentials" class="mt-4 p-3 bg-muted rounded-md">
+                                    <p class="text-xs text-muted-foreground text-center">
+                                        <strong>Demo Credentials:</strong><br />
+                                        Patient: patient@demo.com / patient123<br />
+                                        Admin: admin@pathologylab.com / admin123
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function addAuthFormEventListeners() {
+            const emailInput = document.getElementById('auth-email');
+            const passwordInput = document.getElementById('auth-password');
+            const roleSelect = document.getElementById('auth-role');
+            const submitButton = document.getElementById('auth-submit-button');
+            const toggleModeBtn = document.getElementById('auth-toggle-mode-btn');
+            const authForm = document.getElementById('auth-form');
+            const backToHomeBtn = document.getElementById('auth-back-to-home-btn');
+
+            // Set initial mode for the auth form
+            isLoginMode = (initialAuthFormMode === 'login');
+
+            // Event Listeners
+            authForm.addEventListener('submit', handleAuthSubmit);
+            emailInput.addEventListener('input', updateAuthSubmitButtonState);
+            passwordInput.addEventListener('input', updateAuthSubmitButtonState);
+
+            toggleModeBtn.addEventListener('click', () => {
+                isLoginMode = !isLoginMode;
+                updateAuthFormModeUI();
+            });
+
+            backToHomeBtn.addEventListener('click', switchToHome);
+
+            // Initial UI update based on default mode - now called directly after getting elements
+            updateAuthFormModeUI();
+
+            /**
+             * Handles form submission (Login/Register).
+             * @param {Event} e - The form submission event.
+             */
+            async function handleAuthSubmit(e) {
+                e.preventDefault();
+                setAuthLoading(true);
+
+                const email = emailInput.value;
+                const password = passwordInput.value;
+                const role = isLoginMode ? 'patient' : (roleSelect ? roleSelect.value : 'patient'); // Default to patient if select not found
+
+                try {
+                    let success = false;
+                    // Use the globally exposed Firebase auth functions
+                    if (isLoginMode) {
+                        success = await window.firebaseAuth.login(email, password);
+                    } else {
+                        success = await window.firebaseAuth.register(email, password, role);
+                    }
+
+                    if (success) {
+                        showToast({
+                            title: "Authentication Successful",
+                            description: `Welcome ${isLoginMode ? 'back' : ''} to LP Care Pathology`,
+                            variant: "success",
+                        });
+                        // Clear form fields on successful authentication
+                        emailInput.value = '';
+                        passwordInput.value = '';
+                        // Render the appropriate dashboard after successful login/registration
+                        renderView();
+                    } else {
+                        // Toast message already handled by authenticate for specific cases
+                        // Fallback for generic failure if no specific toast was shown
+                        if (!toastContainer.querySelector('.toast')) {
+                            showToast({
+                                title: "Authentication Failed",
+                                description: "Please check your credentials and try again.",
+                                variant: "destructive",
+                            });
+                        }
+                    }
+                } catch (error) {
+                    console.error("Authentication error:", error);
+                    showToast({
+                        title: "Error",
+                        description: "An unexpected error occurred. Please try again.",
+                        variant: "destructive",
+                    });
+                } finally {
+                    setAuthLoading(false);
+                }
+            }
+
+            /**
+             * Updates the loading state and disables/enables the submit button.
+             * @param {boolean} isLoading - True if loading, false otherwise.
+             */
+            function setAuthLoading(isLoading) {
+                authFormLoading = isLoading;
+                submitButton.disabled = isLoading;
+                submitButton.textContent = isLoading ? 'Processing...' : (isLoginMode ? 'Login' : 'Register');
+            }
+
+            /**
+             * Checks if the form inputs are valid to enable the submit button.
+             */
+            function updateAuthSubmitButtonState() {
+                const isEmailValid = emailInput.value.includes('@') && emailInput.value.length > 0;
+                const isPasswordValid = passwordInput.value.length >= 6; // Simple validation
+                submitButton.disabled = !(isEmailValid && isPasswordValid) || authFormLoading;
+            }
+        }
+
+        // --- Admin Dashboard HTML and Event Listeners ---
+        let adminTestName = '';
+        let adminTestPrice = '';
+        let adminSelectedPatient = '';
+        let adminSelectedBookingId = '';
+        let adminReportDescription = ''; // Changed from adminReportFile
+        let adminSearchQuery = '';
+        let currentAdminTab = 'add-test'; // Default tab for admin
+
+        function getAdminDashboardHTML() {
+            const user = window.appState.user;
+            const tests = window.appState.tests;
+            const bookings = window.appState.bookings;
+
+            const pendingBookings = bookings.filter(booking => booking.status === 'pending');
+            const completedBookings = bookings.filter(booking => booking.status === 'completed');
+            
+            const patients = Array.from(new Set(bookings.map(b => b.userEmail)))
+                .map(email => ({ email, bookings: bookings.filter(b => b.userEmail === email) }));
+
+            const filteredReports = completedBookings.filter(booking => 
+                booking.userEmail.toLowerCase().includes(adminSearchQuery.toLowerCase()) ||
+                booking.testName.toLowerCase().includes(adminSearchQuery.toLowerCase())
+            );
+
+            const getPatientBookings = (patientEmail) => {
+                return bookings.filter(b => b.userEmail === patientEmail && b.status === 'pending');
+            };
+
+            const formatDate = (dateString) => {
+                return new Date(dateString).toLocaleDateString('en-US', {
+                    year: 'numeric',
+                    month: 'long',
+                    day: 'numeric'
+                });
+            };
+
+            return `
+                <div class="min-h-screen bg-gradient-subtle">
+                    <!-- Header -->
+                    <header class="bg-white shadow-card border-b">
+                        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div class="flex justify-between items-center h-16">
+                                <div class="flex items-center">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-lg text-primary mr-3">
+                                        <path d="M14.5 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V7.5L14.5 2z"></path>
+                                        <polyline points="14 2 14 8 20 8"></polyline>
+                                        <line x1="16" y1="13" x2="8" y2="13"></line>
+                                        <line x1="16" y1="17" x2="8" y2="17"></line>
+                                    </svg>
+                                    <h1 class="text-xl font-semibold text-gray-900">LP Care Pathology - Admin Panel</h1>
+                                </div>
+                                <div class="flex items-center space-x-4">
+                                    <div class="flex items-center text-sm text-gray-600">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm mr-2">
+                                            <path d="M19 21v-2a4 4 0 00-4-4H9a4 4 0 00-4 4v2"></path>
+                                            <circle cx="12" cy="7" r="4"></circle>
+                                        </svg>
+                                        ${user?.email}
+                                    </div>
+                                    <button id="admin-logout-btn" class="btn-medical btn-medical-ghost">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm mr-2">
+                                            <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"></path>
+                                            <polyline points="16 17 21 12 16 7"></polyline>
+                                            <line x1="21" y1="12" x2="9" y2="12"></line>
+                                        </svg>
+                                        Logout
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </header>
+
+                    <!-- Main Content -->
+                    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+                        <div class="mb-8">
+                            <h2 class="text-2xl font-bold text-gray-900 mb-2">Admin Dashboard</h2>
+                            <p class="text-gray-600">Manage tests, upload reports, and monitor lab operations</p>
+                        </div>
+
+                        <div class="tabs space-y-6">
+                            <div class="tabs-list grid w-full grid-cols-5">
+                                <button data-tab="add-test" class="tabs-trigger flex items-center gap-2 ${currentAdminTab === 'add-test' ? 'active' : ''}">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm">
+                                        <line x1="12" y1="5" x2="12" y2="19"></line>
+                                        <line x1="5" y1="12" x2="19" y2="12"></line>
+                                    </svg>
+                                    Add Test
+                                </button>
+                                <button data-tab="upload-report" class="tabs-trigger flex items-center gap-2 ${currentAdminTab === 'upload-report' ? 'active' : ''}">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm">
+                                        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"></path>
+                                        <polyline points="17 8 12 3 7 8"></polyline>
+                                        <line x1="12" y1="3" x2="12" y2="15"></line>
+                                    </svg>
+                                    Add Report Description
+                                </button>
+                                <button data-tab="pending" class="tabs-trigger flex items-center gap-2 ${currentAdminTab === 'pending' ? 'active' : ''}">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm">
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                        <polyline points="12 6 12 12 16 14"></polyline>
+                                    </svg>
+                                    Pending (${pendingBookings.length})
+                                </button>
+                                <button data-tab="completed" class="tabs-trigger flex items-center gap-2 ${currentAdminTab === 'completed' ? 'active' : ''}">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm">
+                                        <polyline points="20 6 9 17 4 12"></polyline>
+                                    </svg>
+                                    Completed (${completedBookings.length})
+                                </button>
+                                <button data-tab="all-reports" class="tabs-trigger flex items-center gap-2 ${currentAdminTab === 'all-reports' ? 'active' : ''}">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm">
+                                        <path d="M14.5 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V7.5L14.5 2z"></path>
+                                        <polyline points="14 2 14 8 20 8"></polyline>
+                                        <line x1="16" y1="13" x2="8" y2="13"></line>
+                                        <line x1="16" y1="17" x2="8" y2="17"></line>
+                                    </svg>
+                                    All Reports
+                                </button>
+                            </div>
+
+                            <div id="tab-content-add-test" class="tabs-content" data-state="${currentAdminTab === 'add-test' ? 'active' : 'inactive'}">
+                                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                                    <div class="card shadow-card">
+                                        <div class="card-header">
+                                            <h3 class="card-title flex items-center gap-2">
+                                                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-primary">
+                                                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                                                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                                                </svg>
+                                                Add New Test
+                                            </h3>
+                                            <p class="card-description">
+                                                Add a new test to the catalog with pricing
+                                            </p>
+                                        </div>
+                                        <div class="card-content space-y-4">
+                                            <div class="space-y-2">
+                                                <label for="admin-test-name">Test Name</label>
+                                                <input
+                                                    id="admin-test-name"
+                                                    type="text"
+                                                    placeholder="Enter test name"
+                                                    value="${adminTestName}"
+                                                />
+                                            </div>
+                                            <div class="space-y-2">
+                                                <label for="admin-test-price">Price (₹)</label>
+                                                <input
+                                                    id="admin-test-price"
+                                                    type="number"
+                                                    placeholder="Enter price"
+                                                    value="${adminTestPrice}"
+                                                    min="0"
+                                                />
+                                            </div>
+                                            <button id="admin-add-test-btn" class="btn-medical btn-medical-default w-full">
+                                                Add Test
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div class="card shadow-card">
+                                        <div class="card-header">
+                                            <h3 class="card-title">Existing Tests</h3>
+                                            <p class="card-description">
+                                                Current test catalog (${tests.length} tests)
+                                            </p>
+                                        </div>
+                                        <div class="card-content">
+                                            <div class="space-y-3 max-h-80 overflow-y-auto">
+                                                ${tests.length === 0 ? `
+                                                    <div class="text-center py-8 text-gray-500">
+                                                        <p>No tests added yet.</p>
+                                                    </div>
+                                                ` : tests.map(test => `
+                                                    <div class="flex items-center justify-between p-3 border rounded-lg">
+                                                        <div>
+                                                            <h4 class="font-medium">${test.name}</h4>
+                                                            <p class="text-sm text-gray-600">₹${test.price}</p>
+                                                        </div>
+                                                        <button data-test-id="${test.id}" class="admin-delete-test-btn btn-medical btn-medical-ghost btn-medical-sm">
+                                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm">
+                                                                <polyline points="3 6 5 6 21 6"></polyline>
+                                                                <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"></path>
+                                                                <line x1="10" y1="11" x2="10" y2="17"></line>
+                                                                <line x1="14" y1="11" x2="14" y2="17"></line>
+                                                            </svg>
+                                                        </button>
+                                                    </div>
+                                                `).join('')}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div id="tab-content-upload-report" class="tabs-content" data-state="${currentAdminTab === 'upload-report' ? 'active' : 'inactive'}">
+                                <div class="card shadow-card">
+                                    <div class="card-header">
+                                        <h3 class="card-title flex items-center gap-2">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-primary">
+                                                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"></path>
+                                                <polyline points="17 8 12 3 7 8"></polyline>
+                                                <line x1="12" y1="3" x2="12" y2="15"></line>
+                                            </svg>
+                                            Add Test Report Description
+                                        </h3>
+                                        <p class="card-description">
+                                            Add a descriptive summary for completed appointments
+                                        </p>
+                                    </div>
+                                    <div class="card-content space-y-6">
+                                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                            <div class="space-y-2">
+                                                <label for="admin-patient-select">Select Patient</label>
+                                                <div class="select-wrapper">
+                                                    <select id="admin-patient-select" class="select-trigger">
+                                                        <option value="">Choose patient</option>
+                                                        ${patients.map(patient => `
+                                                            <option value="${patient.email}" ${adminSelectedPatient === patient.email ? 'selected' : ''}>
+                                                                ${patient.email}
+                                                            </option>
+                                                        `).join('')}
+                                                    </select>
+                                                </div>
+                                            </div>
+
+                                            <div class="space-y-2">
+                                                <label for="admin-booking-select">Select Test Booking</label>
+                                                <div class="select-wrapper">
+                                                    <select id="admin-booking-select" class="select-trigger" ${!adminSelectedPatient ? 'disabled' : ''}>
+                                                        <option value="">Choose booking</option>
+                                                        ${getPatientBookings(adminSelectedPatient).map(booking => `
+                                                            <option value="${booking.id}" ${adminSelectedBookingId === booking.id ? 'selected' : ''}>
+                                                                ${booking.testName} - ${formatDate(booking.appointmentDate)}
+                                                            </option>
+                                                        `).join('')}
+                                                    </select>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <div class="space-y-2">
+                                            <label for="admin-report-description">Report Description</label>
+                                            <textarea
+                                                id="admin-report-description"
+                                                placeholder="Enter report summary or findings..."
+                                                rows="4"
+                                                class="rounded-md"
+                                            >${adminReportDescription}</textarea>
+                                        </div>
+
+                                        <button id="admin-upload-report-btn" class="btn-medical btn-medical-default w-full md:w-auto">
+                                            Add Report Description
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div id="tab-content-pending" class="tabs-content" data-state="${currentAdminTab === 'pending' ? 'active' : 'inactive'}">
+                                <div class="card shadow-card">
+                                    <div class="card-header">
+                                        <h3 class="card-title flex items-center gap-2">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-warning">
+                                                <circle cx="12" cy="12" r="10"></circle>
+                                                <polyline points="12 6 12 12 16 14"></polyline>
+                                            </svg>
+                                            Pending Tests
+                                        </h3>
+                                        <p class="card-description">
+                                            Tests scheduled but not yet completed
+                                        </p>
+                                    </div>
+                                    <div class="card-content">
+                                        ${pendingBookings.length === 0 ? `
+                                            <div class="text-center py-8 text-gray-500">
+                                                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-xl mx-auto mb-4 opacity-50">
+                                                    <circle cx="12" cy="12" r="10"></circle>
+                                                    <polyline points="12 6 12 12 16 14"></polyline>
+                                                </svg>
+                                                <p>No pending tests found</p>
+                                            </div>
+                                        ` : `
+                                            <div class="space-y-4">
+                                                ${pendingBookings.map(booking => `
+                                                    <div class="flex items-center justify-between p-4 border rounded-lg bg-yellow-50 border-yellow-200">
+                                                        <div class="flex items-center space-x-4">
+                                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-lg text-warning">
+                                                                <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"></path>
+                                                                <circle cx="9" cy="7" r="4"></circle>
+                                                                <path d="M23 21v-2a4 4 0 00-3-3.87"></path>
+                                                                <path d="M16 3.13a4 4 0 010 7.75"></path>
+                                                            </svg>
+                                                            <div>
+                                                                <h3 class="font-medium">${booking.testName}</h3>
+                                                                <p class="text-sm text-gray-600">Patient: ${booking.userEmail}</p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Scheduled: ${formatDate(booking.appointmentDate)}
+                                                                </p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Name: ${booking.patientName || 'N/A'}
+                                                                </p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Mobile: ${booking.patientMobile || 'N/A'}
+                                                                </p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Address: ${booking.patientAddress || 'N/A'}
+                                                                </p>
+                                                            </div>
+                                                        </div>
+                                                        <span class="badge badge-secondary">Pending</span>
+                                                    </div>
+                                                `).join('')}
+                                            </div>
+                                        `}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div id="tab-content-completed" class="tabs-content" data-state="${currentAdminTab === 'completed' ? 'active' : 'inactive'}">
+                                <div class="card shadow-card">
+                                    <div class="card-header">
+                                        <h3 class="card-title flex items-center gap-2">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-success">
+                                                <polyline points="20 6 9 17 4 12"></polyline>
+                                            </svg>
+                                            Completed Tests
+                                        </h3>
+                                        <p class="card-description">
+                                            Tests with uploaded reports
+                                        </p>
+                                    </div>
+                                    <div class="card-content">
+                                        ${completedBookings.length === 0 ? `
+                                            <div class="text-center py-8 text-gray-500">
+                                                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-xl mx-auto mb-4 opacity-50">
+                                                    <path d="M14.5 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V7.5L14.5 2z"></path>
+                                                    <polyline points="14 2 14 8 20 8"></polyline>
+                                                    <line x1="16" y1="13" x2="8" y2="13"></line>
+                                                    <line x1="16" y1="17" x2="8" y2="17"></line>
+                                                </svg>
+                                                <p>No completed tests found</p>
+                                            </div>
+                                        ` : `
+                                            <div class="space-y-4">
+                                                ${completedBookings.map(booking => `
+                                                    <div class="flex items-center justify-between p-4 border rounded-lg bg-green-50 border-green-200">
+                                                        <div class="flex items-center space-x-4">
+                                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-lg text-success">
+                                                                <polyline points="20 6 9 17 4 12"></polyline>
+                                                            </svg>
+                                                            <div>
+                                                                <h3 class="font-medium">${booking.testName}</h3>
+                                                                <p class="text-sm text-gray-600">Patient: ${booking.userEmail}</p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Completed: ${formatDate(booking.appointmentDate)}
+                                                                </p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Name: ${booking.patientName || 'N/A'}
+                                                                </p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Mobile: ${booking.patientMobile || 'N/A'}
+                                                                </p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Address: ${booking.patientAddress || 'N/A'}
+                                                                </p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Description: ${booking.reportContent || 'N/A'}
+                                                                </p>
+                                                            </div>
+                                                        </div>
+                                                        <div class="flex items-center space-x-2">
+                                                            <span class="badge badge-default bg-success">Completed</span>
+                                                            <button data-report-content="${booking.reportContent}" class="view-report-description-btn btn-medical btn-medical-outline btn-medical-sm">
+                                                                View Description
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                `).join('')}
+                                            </div>
+                                        `}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div id="tab-content-all-reports" class="tabs-content" data-state="${currentAdminTab === 'all-reports' ? 'active' : 'inactive'}">
+                                <div class="card shadow-card">
+                                    <div class="card-header">
+                                        <h3 class="card-title flex items-center gap-2">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-primary">
+                                                <path d="M14.5 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V7.5L14.5 2z"></path>
+                                                <polyline points="14 2 14 8 20 8"></polyline>
+                                                <line x1="16" y1="13" x2="8" y2="13"></line>
+                                                <line x1="16" y1="17" x2="8" y2="17"></line>
+                                            </svg>
+                                            All Reports
+                                        </h3>
+                                        <p class="card-description">
+                                            Search and manage all test reports
+                                        </p>
+                                    </div>
+                                    <div class="card-content space-y-6">
+                                        <div class="flex items-center space-x-2">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-gray-400">
+                                                <circle cx="11" cy="11" r="8"></circle>
+                                                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                                            </svg>
+                                            <input
+                                                id="admin-search-query"
+                                                type="text"
+                                                placeholder="Search by patient email or test name..."
+                                                value="${adminSearchQuery}"
+                                                class="flex-1"
+                                            />
+                                        </div>
+
+                                        <div class="space-y-4">
+                                            ${filteredReports.length === 0 ? `
+                                                <div class="text-center py-8 text-gray-500">
+                                                    <p>No reports found matching your search.</p>
+                                                </div>
+                                            ` : filteredReports.map(booking => `
+                                                <div class="flex items-center justify-between p-4 border rounded-lg">
+                                                    <div class="flex items-center space-x-4">
+                                                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-lg text-primary">
+                                                            <path d="M14.5 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V7.5L14.5 2z"></path>
+                                                            <polyline points="14 2 14 8 20 8"></polyline>
+                                                            <line x1="16" y1="13" x2="8" y2="13"></line>
+                                                            <line x1="16" y1="17" x2="8" y2="17"></line>
+                                                        </svg>
+                                                        <div>
+                                                            <h3 class="font-medium">${booking.testName}</h3>
+                                                            <p class="text-sm text-gray-600">Patient: ${booking.userEmail}</p>
+                                                            <p class="text-sm text-gray-600">
+                                                                Date: ${formatDate(booking.appointmentDate)}
+                                                            </p>
+                                                            <p class="text-sm text-gray-600">
+                                                                Name: ${booking.patientName || 'N/A'}
+                                                            </p>
+                                                            <p class="text-sm text-gray-600">
+                                                                Mobile: ${booking.patientMobile || 'N/A'}
+                                                            </p>
+                                                            <p class="text-sm text-gray-600">
+                                                                Address: ${booking.patientAddress || 'N/A'}
+                                                            </p>
+                                                            <p class="text-sm text-gray-600">
+                                                                Description: ${booking.reportContent || 'N/A'}
+                                                            </p>
+                                                        </div>
+                                                    </div>
+                                                    <div class="flex items-center space-x-2">
+                                                        <span class="badge badge-default bg-success">Completed</span>
+                                                        <button data-report-content="${booking.reportContent}" class="view-report-description-btn btn-medical btn-medical-outline btn-medical-sm">
+                                                            View Description
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            `).join('')}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </main>
+                </div>
+            `;
+        }
+
+        function addAdminDashboardEventListeners() {
+            document.getElementById('admin-logout-btn').addEventListener('click', window.firebaseAuth.logout);
+
+            // Tabs functionality
+            document.querySelectorAll('.tabs-list .tabs-trigger').forEach(tabButton => {
+                tabButton.addEventListener('click', () => {
+                    const tab = tabButton.dataset.tab;
+                    currentAdminTab = tab; // Update state
+                    renderView(); // Re-render to show correct tab content
+                });
+            });
+
+            // Add Test functionality
+            const adminTestNameInput = document.getElementById('admin-test-name');
+            const adminTestPriceInput = document.getElementById('admin-test-price');
+            const adminAddTestBtn = document.getElementById('admin-add-test-btn');
+
+            if (adminAddTestBtn) {
+                adminAddTestBtn.addEventListener('click', () => {
+                    const name = adminTestNameInput.value.trim();
+                    const price = parseFloat(adminTestPriceInput.value);
+
+                    if (!name || isNaN(price) || price < 0) {
+                        showToast({
+                            title: "Invalid Input",
+                            description: "Please provide a valid test name and price.",
+                            variant: "destructive",
+                        });
+                        return;
+                    }
+                    window.firebaseAuth.addTest(name, price);
+                    adminTestName = ''; // Clear state
+                    adminTestPrice = ''; // Clear state
+                    // No need to manually update UI for test list, onSnapshot will handle it
+                    // but clear the form fields
+                    if (adminTestNameInput) adminTestNameInput.value = '';
+                    if (adminTestPriceInput) adminTestPriceInput.value = '';
+                });
+            }
+
+            // Delete Test functionality
+            document.querySelectorAll('.admin-delete-test-btn').forEach(deleteButton => {
+                deleteButton.addEventListener('click', (e) => {
+                    const testId = e.currentTarget.dataset.testId;
+                    if (confirm('Are you sure you want to delete this test?')) {
+                        window.firebaseAuth.deleteTest(testId);
+                    }
+                });
+            });
+            
+            // Add Report Description functionality
+            const adminReportDescriptionInput = document.getElementById('admin-report-description');
+            const adminUploadReportBtn = document.getElementById('admin-upload-report-btn');
+            const adminPatientSelect = document.getElementById('admin-patient-select');
+            const adminBookingSelect = document.getElementById('admin-booking-select');
+
+            if (adminPatientSelect) {
+                adminPatientSelect.addEventListener('change', (e) => {
+                    adminSelectedPatient = e.target.value;
+                    adminSelectedBookingId = ''; // Reset booking when patient changes
+                    renderView(); // Re-render to update booking options
+                });
+            }
+            if (adminBookingSelect) {
+                adminBookingSelect.addEventListener('change', (e) => {
+                    adminSelectedBookingId = e.target.value;
+                });
+            }
+            if (adminReportDescriptionInput) {
+                adminReportDescriptionInput.addEventListener('input', (e) => {
+                    adminReportDescription = e.target.value;
+                });
+            }
+
+            if (adminUploadReportBtn) {
+                adminUploadReportBtn.addEventListener('click', async () => {
+                    if (!adminSelectedBookingId || adminReportDescription.trim() === '') {
+                        showToast({
+                            title: "Incomplete Information",
+                            description: "Please select a booking and provide a report description.",
+                            variant: "destructive",
+                        });
+                        return;
+                    }
+
+                    window.firebaseAuth.uploadReport(adminSelectedBookingId, adminReportDescription);
+                    
+                    adminSelectedBookingId = '';
+                    adminReportDescription = ''; // Clear state
+                    adminSelectedPatient = ''; // Clear patient selection too
+                    // Clear form fields
+                    if (adminPatientSelect) adminPatientSelect.value = '';
+                    if (adminBookingSelect) adminBookingSelect.value = '';
+                    if (adminReportDescriptionInput) adminReportDescriptionInput.value = '';
+                });
+            }
+
+            // Search functionality for All Reports tab
+            const adminSearchInput = document.getElementById('admin-search-query');
+            if (adminSearchInput) {
+                adminSearchInput.addEventListener('input', (e) => {
+                    adminSearchQuery = e.target.value;
+                    renderView(); // Re-render to filter reports
+                });
+            }
+        }
+
+        // --- Patient Dashboard HTML and Event Listeners ---
+        let patientSelectedTestId = '';
+        let patientAppointmentDate = '';
+        let patientName = ''; // New state variable
+        let patientMobile = ''; // New state variable
+        let patientAddress = ''; // New state variable
+        let currentPatientTab = 'book-test'; // Default tab for patient
+
+        function getPatientDashboardHTML() {
+            const user = window.appState.user;
+            const tests = window.appState.tests;
+            const bookings = window.appState.bookings;
+
+            const userBookings = bookings.filter(booking => booking.userId === user?.id);
+            const pendingTests = userBookings.filter(booking => booking.status === 'pending');
+            const completedTests = userBookings.filter(booking => booking.status === 'completed');
+
+            const formatDate = (dateString) => {
+                return new Date(dateString).toLocaleDateString('en-US', {
+                    year: 'numeric',
+                    month: 'long',
+                    day: 'numeric'
+                });
+            };
+
+            const getTestPrice = (testId) => {
+                const test = tests.find(t => t.id === testId);
+                return test ? `₹${test.price}` : '';
+            };
+
+            return `
+                <div class="min-h-screen bg-gradient-subtle">
+                    <!-- Header -->
+                    <header class="bg-white shadow-card border-b">
+                        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div class="flex justify-between items-center h-16">
+                                <div class="flex items-center">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-lg text-primary mr-3">
+                                        <path d="M14.5 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V7.5L14.5 2z"></path>
+                                        <polyline points="14 2 14 8 20 8"></polyline>
+                                        <line x1="16" y1="13" x2="8" y2="13"></line>
+                                        <line x1="16" y1="17" x2="8" y2="17"></line>
+                                    </svg>
+                                    <h1 class="text-xl font-semibold text-gray-900">LP Care Pathology - Patient Portal</h1>
+                                </div>
+                                <div class="flex items-center space-x-4">
+                                    <div class="flex items-center text-sm text-gray-600">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm mr-2">
+                                            <path d="M19 21v-2a4 4 0 00-4-4H9a4 4 0 00-4 4v2"></path>
+                                            <circle cx="12" cy="7" r="4"></circle>
+                                        </svg>
+                                        ${user?.email}
+                                    </div>
+                                    <button id="patient-logout-btn" class="btn-medical btn-medical-ghost">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm mr-2">
+                                            <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"></path>
+                                            <polyline points="16 17 21 12 16 7"></polyline>
+                                            <line x1="21" y1="12" x2="9" y2="12"></line>
+                                        </svg>
+                                        Logout
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </header>
+
+                    <!-- Main Content -->
+                    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+                        <div class="mb-8">
+                            <h2 class="text-2xl font-bold text-gray-900 mb-2">Welcome, ${user?.email}</h2>
+                            <p class="text-gray-600">Manage your medical tests and view reports</p>
+                        </div>
+
+                        <div class="tabs space-y-6">
+                            <div class="tabs-list grid w-full grid-cols-3">
+                                <button data-tab="book-test" class="tabs-trigger flex items-center gap-2 ${currentPatientTab === 'book-test' ? 'active' : ''}">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm">
+                                        <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+                                        <line x1="16" y1="2" x2="16" y2="6"></line>
+                                        <line x1="8" y1="2" x2="8" y2="6"></line>
+                                        <line x1="3" y1="10" x2="21" y2="10"></line>
+                                    </svg>
+                                    Book New Test
+                                </button>
+                                <button data-tab="pending" class="tabs-trigger flex items-center gap-2 ${currentPatientTab === 'pending' ? 'active' : ''}">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm">
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                        <polyline points="12 6 12 12 16 14"></polyline>
+                                    </svg>
+                                    Pending Tests (${pendingTests.length})
+                                </button>
+                                <button data-tab="completed" class="tabs-trigger flex items-center gap-2 ${currentPatientTab === 'completed' ? 'active' : ''}">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm">
+                                        <path d="M14.5 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V7.5L14.5 2z"></path>
+                                        <polyline points="14 2 14 8 20 8"></polyline>
+                                        <line x1="16" y1="13" x2="8" y2="13"></line>
+                                        <line x1="16" y1="17" x2="8" y2="17"></line>
+                                    </svg>
+                                    Completed Reports (${completedTests.length})
+                                </button>
+                            </div>
+
+                            <div id="patient-tab-content-book-test" class="tabs-content" data-state="${currentPatientTab === 'book-test' ? 'active' : 'inactive'}">
+                                <div class="card shadow-card">
+                                    <div class="card-header">
+                                        <h3 class="card-title flex items-center gap-2">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-primary">
+                                                <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+                                                <line x1="16" y1="2" x2="16" y2="6"></line>
+                                                <line x1="8" y1="2" x2="8" y2="6"></line>
+                                                <line x1="3" y1="10" x2="21" y2="10"></line>
+                                            </svg>
+                                            Book a New Test
+                                        </h3>
+                                        <p class="card-description">
+                                            Select a test and choose your preferred appointment date
+                                        </p>
+                                    </div>
+                                    <div class="card-content space-y-6">
+                                        <div class="space-y-2">
+                                            <label for="patient-name">Your Name</label>
+                                            <input
+                                                id="patient-name"
+                                                type="text"
+                                                placeholder="Enter your full name"
+                                                value="${patientName}"
+                                            />
+                                        </div>
+                                        <div class="space-y-2">
+                                            <label for="patient-mobile">Mobile Number</label>
+                                            <input
+                                                id="patient-mobile"
+                                                type="tel"
+                                                placeholder="Enter your mobile number"
+                                                value="${patientMobile}"
+                                            />
+                                        </div>
+                                        <div class="space-y-2">
+                                            <label for="patient-address">Address</label>
+                                            <textarea
+                                                id="patient-address"
+                                                placeholder="Enter your address"
+                                                rows="3"
+                                                class="rounded-md"
+                                            >${patientAddress}</textarea>
+                                        </div>
+                                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                            <div class="space-y-2">
+                                                <label for="patient-test-select">Select Test</label>
+                                                <div class="select-wrapper">
+                                                    <select id="patient-test-select" class="select-trigger">
+                                                        <option value="">Choose a test</option>
+                                                        ${tests.map(test => `
+                                                            <option value="${test.id}" ${patientSelectedTestId === test.id ? 'selected' : ''}>
+                                                                ${test.name} - ₹${test.price}
+                                                            </option>
+                                                        `).join('')}
+                                                    </select>
+                                                </div>
+                                            </div>
+
+                                            <div class="space-y-2">
+                                                <label for="patient-appointment-date">Appointment Date</label>
+                                                <input
+                                                    id="patient-appointment-date"
+                                                    type="date"
+                                                    value="${patientAppointmentDate}"
+                                                    min="${new Date().toISOString().split('T')[0]}"
+                                                />
+                                            </div>
+                                        </div>
+
+                                        <button id="patient-book-test-btn" class="btn-medical btn-medical-default w-full md:w-auto">
+                                            Book Test Appointment
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div id="patient-tab-content-pending" class="tabs-content" data-state="${currentPatientTab === 'pending' ? 'active' : 'inactive'}">
+                                <div class="card shadow-card">
+                                    <div class="card-header">
+                                        <h3 class="card-title flex items-center gap-2">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-warning">
+                                                <circle cx="12" cy="12" r="10"></circle>
+                                                <polyline points="12 6 12 12 16 14"></polyline>
+                                            </svg>
+                                            Pending Tests
+                                        </h3>
+                                        <p class="card-description">
+                                            Your scheduled tests awaiting completion
+                                        </p>
+                                    </div>
+                                    <div class="card-content">
+                                        ${pendingTests.length === 0 ? `
+                                            <div class="text-center py-8 text-gray-500">
+                                                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-xl mx-auto mb-4 opacity-50">
+                                                    <circle cx="12" cy="12" r="10"></circle>
+                                                    <polyline points="12 6 12 12 16 14"></polyline>
+                                                </svg>
+                                                <p>No pending tests found</p>
+                                            </div>
+                                        ` : `
+                                            <div class="space-y-4">
+                                                ${pendingTests.map(booking => `
+                                                    <div class="flex items-center justify-between p-4 border rounded-lg bg-yellow-50 border-yellow-200">
+                                                        <div class="flex items-center space-x-4">
+                                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-lg text-warning">
+                                                                <path d="M14.5 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V7.5L14.5 2z"></path>
+                                                                <polyline points="14 2 14 8 20 8"></polyline>
+                                                                <line x1="16" y1="13" x2="8" y2="13"></line>
+                                                                <line x1="16" y1="17" x2="8" y2="17"></line>
+                                                            </svg>
+                                                            <div>
+                                                                <h3 class="font-medium">${booking.testName}</h3>
+                                                                <p class="text-sm text-gray-600">Patient: ${booking.userEmail}</p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Scheduled: ${formatDate(booking.appointmentDate)}
+                                                                </p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Name: ${booking.patientName || 'N/A'}
+                                                                </p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Mobile: ${booking.patientMobile || 'N/A'}
+                                                                </p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Address: ${booking.patientAddress || 'N/A'}
+                                                                </p>
+                                                            </div>
+                                                        </div>
+                                                        <span class="badge badge-secondary">Pending</span>
+                                                    </div>
+                                                `).join('')}
+                                            </div>
+                                        `}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div id="patient-tab-content-completed" class="tabs-content" data-state="${currentPatientTab === 'completed' ? 'active' : 'inactive'}">
+                                <div class="card shadow-card">
+                                    <div class="card-header">
+                                        <h3 class="card-title flex items-center gap-2">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-sm text-success">
+                                                <polyline points="20 6 9 17 4 12"></polyline>
+                                            </svg>
+                                            Completed Reports
+                                        </h3>
+                                        <p class="card-description">
+                                            Your test results and medical reports
+                                        </p>
+                                    </div>
+                                    <div class="card-content">
+                                        ${completedTests.length === 0 ? `
+                                            <div class="text-center py-8 text-gray-500">
+                                                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-xl mx-auto mb-4 opacity-50">
+                                                    <path d="M14.5 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V7.5L14.5 2z"></path>
+                                                    <polyline points="14 2 14 8 20 8"></polyline>
+                                                    <line x1="16" y1="13" x2="8" y2="13"></line>
+                                                    <line x1="16" y1="17" x2="8" y2="17"></line>
+                                                </svg>
+                                                <p>No completed reports found</p>
+                                            </div>
+                                        ` : `
+                                            <div class="space-y-4">
+                                                ${completedTests.map(booking => `
+                                                    <div class="flex items-center justify-between p-4 border rounded-lg bg-green-50 border-green-200">
+                                                        <div class="flex items-center space-x-4">
+                                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-lg text-success">
+                                                                <polyline points="20 6 9 17 4 12"></polyline>
+                                                            </svg>
+                                                            <div>
+                                                                <h3 class="font-medium">${booking.testName}</h3>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Completed: ${formatDate(booking.appointmentDate)}
+                                                                </p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Cost: ${getTestPrice(booking.testId)}
+                                                                </p>
+                                                                <p class="text-sm text-gray-600">
+                                                                    Description: ${booking.reportContent || 'N/A'}
+                                                                </p>
+                                                            </div>
+                                                        </div>
+                                                        <div class="flex items-center space-x-2">
+                                                            <span class="badge badge-default bg-success">Completed</span>
+                                                            <button data-report-content="${booking.reportContent}" class="view-report-description-btn btn-medical btn-medical-outline btn-medical-sm">
+                                                                View Description
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                `).join('')}
+                                            </div>
+                                        `}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </main>
+                </div>
+            `;
+        }
+
+        function addPatientDashboardEventListeners() {
+            document.getElementById('patient-logout-btn').addEventListener('click', window.firebaseAuth.logout);
+
+            // Tabs functionality
+            document.querySelectorAll('.tabs-list .tabs-trigger').forEach(tabButton => {
+                tabButton.addEventListener('click', () => {
+                    const tab = tabButton.dataset.tab;
+                    currentPatientTab = tab; // Update state
+                    renderView(); // Re-render to show correct tab content
+                });
+            });
+
+            // Book Test functionality
+            const patientTestSelect = document.getElementById('patient-test-select');
+            const patientAppointmentDateInput = document.getElementById('patient-appointment-date');
+            const patientNameInput = document.getElementById('patient-name'); // New
+            const patientMobileInput = document.getElementById('patient-mobile'); // New
+            const patientAddressInput = document.getElementById('patient-address'); // New
+            const patientBookTestBtn = document.getElementById('patient-book-test-btn');
+
+            if (patientTestSelect) {
+                patientTestSelect.addEventListener('change', (e) => {
+                    patientSelectedTestId = e.target.value;
+                });
+            }
+            if (patientAppointmentDateInput) {
+                patientAppointmentDateInput.addEventListener('change', (e) => {
+                    patientAppointmentDate = e.target.value;
+                });
+            }
+            if (patientNameInput) {
+                patientNameInput.addEventListener('input', (e) => {
+                    patientName = e.target.value;
+                });
+            }
+            if (patientMobileInput) {
+                patientMobileInput.addEventListener('input', (e) => {
+                    patientMobile = e.target.value;
+                });
+            }
+            if (patientAddressInput) {
+                patientAddressInput.addEventListener('input', (e) => {
+                    patientAddress = e.target.value;
+                });
+            }
+
+
+            if (patientBookTestBtn) {
+                patientBookTestBtn.addEventListener('click', () => {
+                    if (!patientSelectedTestId || !patientAppointmentDate || !patientName || !patientMobile || !patientAddress) {
+                        showToast({
+                            title: "Incomplete Information",
+                            description: "Please select a test and appointment date, and fill all your personal details.",
+                            variant: "destructive",
+                        });
+                        return;
+                    }
+
+                    const selectedDate = new Date(patientAppointmentDate);
+                    const today = new Date();
+                    today.setHours(0, 0, 0, 0);
+
+                    if (selectedDate < today) {
+                        showToast({
+                            title: "Invalid Date",
+                            description: "Please select a future date for your appointment.",
+                            variant: "destructive",
+                        });
+                        return;
+                    }
+
+                    window.firebaseAuth.bookTest(patientSelectedTestId, patientAppointmentDate, patientName, patientMobile, patientAddress);
+                    patientSelectedTestId = '';
+                    patientAppointmentDate = '';
+                    patientName = ''; // Clear state
+                    patientMobile = ''; // Clear state
+                    patientAddress = ''; // Clear state
+                    // Clear form fields
+                    if (patientTestSelect) patientTestSelect.value = '';
+                    if (patientAppointmentDateInput) patientAppointmentDateInput.value = '';
+                    if (patientNameInput) patientNameInput.value = '';
+                    if (patientMobileInput) patientMobileInput.value = '';
+                    if (patientAddressInput) patientAddressInput.value = '';
+                });
+            }
+
+            // View Report Description functionality for patients
+            document.addEventListener('click', (e) => {
+                if (e.target && e.target.classList.contains('view-report-description-btn')) {
+                    const reportContent = e.target.dataset.reportContent;
+                    if (reportContent) {
+                        showToast({
+                            title: "Report Description",
+                            description: reportContent,
+                            variant: "info",
+                            duration: 8000 // Show longer for reading
+                        });
+                    } else {
+                        showToast({
+                            title: "No Description",
+                            description: "No report description available.",
+                            variant: "info",
+                        });
+                    }
+                }
+            });
+        }
+
+        // Initial render when the page loads
+        document.addEventListener('DOMContentLoaded', renderView);
+    </script>
+</body>
+</html>
